@@ -20,7 +20,11 @@ __pycache__/
 .env.*.local
 
 # IDE / OS
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
 .idea/
 .DS_Store
 
