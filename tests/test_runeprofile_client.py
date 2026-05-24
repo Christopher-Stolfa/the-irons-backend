@@ -1,9 +1,10 @@
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from app.services.runeprofile import RuneProfileClient, RuneProfileError
+from app.services.runeprofile import RuneProfileClient, RuneProfileError, TTLCache
 
 
 def make_client(handler: httpx.MockTransport) -> RuneProfileClient:
@@ -121,3 +122,164 @@ async def test_timeout_translates_to_504() -> None:
         await client.aclose()
 
     assert excinfo.value.status_code == 504
+
+
+# ---------------------------------------------------------------------------
+# TTLCache unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestTTLCache:
+    def test_set_and_get(self) -> None:
+        cache = TTLCache(default_ttl=60.0)
+        cache.set("k", {"data": 1})
+        assert cache.get("k") == {"data": 1}
+
+    def test_missing_key_returns_none(self) -> None:
+        cache = TTLCache()
+        assert cache.get("nonexistent") is None
+
+    def test_expired_entry_returns_none(self) -> None:
+        cache = TTLCache(default_ttl=0.0)
+        cache.set("k", "val", ttl=0.0)
+        # time.monotonic() will have advanced past ttl=0
+        assert cache.get("k") is None
+
+    def test_clear(self) -> None:
+        cache = TTLCache()
+        cache.set("a", 1)
+        cache.set("b", 2)
+        cache.clear()
+        assert cache.get("a") is None
+        assert cache.get("b") is None
+
+    def test_evict_expired(self) -> None:
+        cache = TTLCache(default_ttl=60.0)
+        cache.set("alive", "yes", ttl=9999)
+        # Force an already-expired entry by writing the expiry timestamp directly.
+        cache._store["dead"] = (0.0, "no")
+        cache.evict_expired()
+        assert cache.get("alive") == "yes"
+        assert cache.get("dead") is None
+
+
+# ---------------------------------------------------------------------------
+# Client-level caching tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_second_call_returns_cached_without_http() -> None:
+    call_count = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json={"skills": {"totalLevel": 2277}})
+
+    client = make_client(httpx.MockTransport(respond))
+    try:
+        r1 = await client.get_summary("Zezima")
+        r2 = await client.get_summary("Zezima")
+    finally:
+        await client.aclose()
+
+    assert r1 == r2
+    assert call_count == 1  # only one HTTP request made
+
+
+@pytest.mark.asyncio
+async def test_different_usernames_are_cached_separately() -> None:
+    call_count = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json={"user": request.url.path})
+
+    client = make_client(httpx.MockTransport(respond))
+    try:
+        await client.get_summary("Zezima")
+        await client.get_summary("Lynx Titan")
+    finally:
+        await client.aclose()
+
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_expires_after_ttl() -> None:
+    call_count = 0
+    fake_time = [1000.0]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json={"v": call_count})
+
+    client = RuneProfileClient(
+        base_url="https://api.runeprofile.com/v1",
+        cache_ttl=60.0,
+    )
+    client._client = httpx.AsyncClient(
+        base_url="https://api.runeprofile.com/v1",
+        transport=httpx.MockTransport(respond),
+    )
+
+    try:
+        with patch("app.services.runeprofile.time.monotonic", side_effect=lambda: fake_time[0]):
+            r1 = await client.get_summary("Zezima")
+
+        # Advance past TTL
+        fake_time[0] = 1061.0
+        with patch("app.services.runeprofile.time.monotonic", side_effect=lambda: fake_time[0]):
+            r2 = await client.get_summary("Zezima")
+    finally:
+        await client.aclose()
+
+    assert r1 == {"v": 1}
+    assert r2 == {"v": 2}
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_errors_are_not_cached() -> None:
+    call_count = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(404, json={"error": "not found"})
+        return httpx.Response(200, json={"found": True})
+
+    client = make_client(httpx.MockTransport(respond))
+    try:
+        with pytest.raises(RuneProfileError):
+            await client.get_summary("Zezima")
+        result = await client.get_summary("Zezima")
+    finally:
+        await client.aclose()
+
+    assert result == {"found": True}
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_model_caches() -> None:
+    call_count = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        return httpx.Response(200, json={"playerModelBase64": "abc123"})
+
+    client = make_client(httpx.MockTransport(respond))
+    try:
+        r1 = await client.get_model("Zezima")
+        r2 = await client.get_model("Zezima")
+    finally:
+        await client.aclose()
+
+    assert r1 == r2
+    assert call_count == 1

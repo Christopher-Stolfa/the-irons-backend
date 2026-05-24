@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     runeprofile_user_agent: str = "the-irons-backend"
     runeprofile_username: str | None = None
     runeprofile_timeout_seconds: float = 10.0
+    runeprofile_cache_ttl_seconds: float = 3600.0
 
 
 @lru_cache

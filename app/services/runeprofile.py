@@ -10,6 +10,8 @@ work without an API key; supplying ``X-API-Key`` just raises the limit.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 from urllib.parse import quote
 
@@ -17,6 +19,8 @@ import httpx
 from fastapi import HTTPException, status
 
 from app.config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 class RuneProfileError(HTTPException):
@@ -103,6 +107,131 @@ class RuneProfileClient:
         return await self._get(
             f"{self._account_path(username)}/collection-log"
             f"/{quote(tab, safe='')}/{quote(page, safe='')}"
+        )
+
+    async def get_clan(
+        self,
+        name: str,
+        *,
+        cursor: str | None = None,
+        direction: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Paginated clan member list.
+
+        Upstream: ``GET /v1/clans/{name}``
+        """
+        params: dict[str, str | int] = {}
+        if cursor is not None:
+            params["cursor"] = cursor
+        if direction is not None:
+            params["direction"] = direction
+        if limit is not None:
+            params["limit"] = limit
+        return await self._get(
+            f"/clans/{quote(name, safe='')}",
+            params=params or None,
+        )
+
+    async def get_clan_members_with_models(
+        self,
+        name: str,
+        *,
+        pet: bool = True,
+    ) -> dict[str, Any]:
+        """Fetch clan roster and every member's 3D model in one call.
+
+        1. Fetches the full clan member list (paginating if needed).
+        2. Concurrently fetches each member's model.
+        3. Returns a combined payload ready for the frontend.
+        """
+        all_members: list[dict[str, Any]] = []
+        cursor: str | None = None
+
+        while True:
+            page = await self.get_clan(name, cursor=cursor, limit=100)
+            all_members.extend(page.get("members", []))
+            if not page.get("hasMore"):
+                break
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+
+        semaphore = asyncio.Semaphore(10)
+
+        async def fetch_member_model(member: dict[str, Any]) -> dict[str, Any]:
+            username = member["username"]
+            async with semaphore:
+                try:
+                    model_data = await self.get_model(username, pet=pet)
+                    model_base64 = model_data.get("playerModelBase64")
+                except Exception:
+                    logger.warning("Failed to fetch model for %s", username)
+                    model_base64 = None
+
+            return {
+                "username": username,
+                "accountType": member.get("accountType"),
+                "clan": member.get("clan"),
+                "playerModelBase64": model_base64,
+            }
+
+        results = await asyncio.gather(
+            *(fetch_member_model(m) for m in all_members)
+        )
+
+        return {
+            "clanName": name,
+            "total": len(results),
+            "members": list(results),
+        }
+
+    async def get_model(
+        self,
+        username: str,
+        *,
+        pet: bool = True,
+    ) -> dict[str, Any]:
+        """Player 3D model as base64-encoded binary PLY.
+
+        This hits the undocumented ``/profiles/models/{username}`` endpoint
+        which lives outside the ``/v1`` namespace, so we construct the full
+        URL rather than going through :meth:`_get` (which would prepend ``/v1``).
+        """
+        origin = str(self._client.base_url).split("/v1")[0].rstrip("/")
+        url = f"{origin}/profiles/models/{quote(username, safe='')}"
+        params: dict[str, str] = {}
+        if pet:
+            params["pet"] = "true"
+
+        try:
+            response = await self._client.get(url, params=params)
+        except httpx.TimeoutException as exc:
+            raise RuneProfileError(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="RuneProfile API timed out",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise RuneProfileError(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to reach RuneProfile API",
+            ) from exc
+
+        if response.is_success:
+            return response.json()
+        if response.status_code == 404:
+            raise RuneProfileError(
+                status_code=404,
+                detail=f"No RuneProfile model found for '{username}'",
+            )
+        if response.status_code == 429:
+            raise RuneProfileError(
+                status_code=429,
+                detail="RuneProfile rate limit exceeded",
+            )
+        raise RuneProfileError(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Unexpected RuneProfile API response: {response.status_code}",
         )
 
     async def get_activities(

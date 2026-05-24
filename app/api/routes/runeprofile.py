@@ -47,6 +47,68 @@ def get_runeprofile_client(request: Request) -> RuneProfileClient:
     return request.app.state.runeprofile_client
 
 
+ClanNamePath = Annotated[
+    str,
+    Path(
+        min_length=1,
+        max_length=100,
+        description="Clan name (e.g. The Irons).",
+        examples=["The Irons"],
+    ),
+]
+
+
+@router.get(
+    "/clan/{name}",
+    summary="Clan members",
+    response_model=dict[str, Any],
+    description=(
+        "Returns clan details and a paginated member list from RuneProfile. "
+        "Each member includes username, account type, and clan rank."
+    ),
+)
+async def get_clan(
+    name: ClanNamePath,
+    cursor: Annotated[
+        str | None,
+        Query(description="Opaque cursor from a previous response."),
+    ] = None,
+    direction: Annotated[
+        Literal["next", "prev"] | None,
+        Query(description="Pagination direction. Defaults to next."),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        Query(ge=1, le=100, description="Members per page (1-100, default 50)."),
+    ] = None,
+    client: RuneProfileClient = Depends(get_runeprofile_client),
+) -> dict[str, Any]:
+    return await client.get_clan(name, cursor=cursor, direction=direction, limit=limit)
+
+
+@router.get(
+    "/clan/{name}/members-with-models",
+    summary="Clan members with 3D models",
+    response_model=dict[str, Any],
+    description=(
+        "Fetches the full clan roster from RuneProfile, then batch-fetches "
+        "every member's 3D model server-side. Returns a single payload with "
+        "each member's username, account type, clan rank, and base64-encoded "
+        "PLY model data. Members whose model could not be fetched will have "
+        "`playerModelBase64: null`."
+    ),
+)
+async def get_clan_members_with_models(
+    name: ClanNamePath,
+    pet: Annotated[
+        bool,
+        Query(description="Include pets in the models."),
+    ] = True,
+    client: RuneProfileClient = Depends(get_runeprofile_client),
+) -> dict[str, Any]:
+    return await client.get_clan_members_with_models(name, pet=pet)
+
+
 @router.get(
     "/me",
     summary="My RuneProfile (full profile)",
@@ -78,6 +140,27 @@ async def get_summary(
     client: RuneProfileClient = Depends(get_runeprofile_client),
 ) -> dict[str, Any]:
     return await client.get_summary(username)
+
+
+@router.get(
+    "/{username}/model",
+    summary="Player 3D model (PLY)",
+    response_model=dict[str, Any],
+    description=(
+        "Proxies the undocumented RuneProfile player model endpoint. "
+        "Returns `{ playerModelBase64: string }` where the base64-decoded "
+        "payload is a binary PLY file with vertex-colored geometry."
+    ),
+)
+async def get_model(
+    username: UsernamePath,
+    pet: Annotated[
+        bool,
+        Query(description="Include the player's pet in the model."),
+    ] = True,
+    client: RuneProfileClient = Depends(get_runeprofile_client),
+) -> dict[str, Any]:
+    return await client.get_model(username, pet=pet)
 
 
 @router.get(
